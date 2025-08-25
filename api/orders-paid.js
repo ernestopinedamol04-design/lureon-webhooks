@@ -34,22 +34,28 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(A, B);
 }
 
-// ================== Fetch Systeme (siempre /api/public) ==================
-async function systemeFetchPublic(path, opts = {}, { tolerate404 = false } = {}) {
+// ================== Fetch Systeme (con fallback /api <-> /api/public) ==================
+async function systemeFetch(path, opts = {}, { tolerate404 = false } = {}) {
   const base = "https://systeme.io";
-  const cleanPath = path.startsWith("/api/public/")
-    ? path
-    : path.startsWith("/api/")
-      ? path.replace(/^\/api\//, "/api/public/")
-      : `/api/public${path.startsWith("/") ? "" : "/"}${path}`;
-
   const headers = {
     "Content-Type": "application/json",
     "X-API-Key": env("SYSTEME_API_KEY"),
     ...(opts.headers || {}),
   };
 
-  const res = await fetch(base + cleanPath, { ...opts, headers });
+  // intento 1: tal cual
+  let url = base + path;
+  let res = await fetch(url, { ...opts, headers });
+
+  // intento 2: alternar /api <-> /api/public si hay 404
+  if (res.status === 404 && path.startsWith("/api/")) {
+    const alt = path.startsWith("/api/public/")
+      ? path.replace(/^\/api\/public\//, "/api/")
+      : path.replace(/^\/api\//, "/api/public/");
+    url = base + alt;
+    res = await fetch(url, { ...opts, headers });
+  }
+
   const text = await res.text();
   let json;
   try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
@@ -58,30 +64,25 @@ async function systemeFetchPublic(path, opts = {}, { tolerate404 = false } = {})
     if (tolerate404 && res.status === 404) {
       return { ok: false, status: 404, json };
     }
-    console.error("Systeme error", res.status, cleanPath, json);
-    throw new Error(`Systeme ${cleanPath} error: ${res.status}`);
+    console.error("Systeme error", res.status, path, json);
+    throw new Error(`Systeme ${path} error: ${res.status}`);
   }
   return { ok: true, status: res.status, json };
 }
 
 // ================== Tags ==================
 async function resolveSystemeTagId(tagValue) {
-  // Si es ID numérico, úsalo tal cual
   if (/^\d+$/.test(String(tagValue))) return Number(tagValue);
-
   const desired = String(tagValue).trim().toLowerCase();
 
-  // listar tags
-  const list = await systemeFetchPublic(`/tags?perPage=100`, { method: "GET" });
+  const list = await systemeFetch(`/api/tags?perPage=100`, { method: "GET" });
   const items = Array.isArray(list.json?.items) ? list.json.items
               : Array.isArray(list.json) ? list.json
               : [];
-
   const hit = items.find(t => String(t?.name || "").toLowerCase() === desired);
   if (hit?.id) return Number(hit.id);
 
-  // crear tag si no existe
-  const created = await systemeFetchPublic(`/tags`, {
+  const created = await systemeFetch(`/api/tags`, {
     method: "POST",
     body: JSON.stringify({ name: String(tagValue) })
   });
@@ -94,24 +95,22 @@ async function resolveSystemeTagId(tagValue) {
 // ================== Contactos ==================
 async function findContactIdByEmail(email) {
   const q = encodeURIComponent(email);
-
-  // Rutas posibles del Public API
   const candidates = [
-    `/contacts?email=${q}`,
-    `/contacts/search?email=${q}`,
+    `/api/contacts?email=${q}`,
+    `/api/public/contacts?email=${q}`,
+    `/api/contacts/search?email=${q}`,
+    `/api/public/contacts/search?email=${q}`,
   ];
 
   for (const path of candidates) {
     try {
-      const r = await systemeFetchPublic(path, { method: "GET" }, { tolerate404: true });
-      if (!r.ok) continue; // 404 => probar otra
-
+      const r = await systemeFetch(path, { method: "GET" }, { tolerate404: true });
+      if (!r.ok) continue;
       const data = r.json;
       const list = Array.isArray(data?.items) ? data.items
                  : Array.isArray(data) ? data
                  : Array.isArray(data?.data) ? data.data
                  : [];
-
       const found = list.find(c => String(c?.email || "").toLowerCase() === email.toLowerCase());
       if (found?.id) return Number(found.id);
     } catch (e) {
@@ -121,25 +120,59 @@ async function findContactIdByEmail(email) {
   return null;
 }
 
+// --- Fallback por formulario (Public API) ---
+async function subscribeViaForm({ email, first_name = "", last_name = "" }) {
+  const formId = process.env.SYSTEME_FALLBACK_FORM_ID;
+  if (!formId) return null; // sin formulario, no podemos usar este plan B
+
+  // Endpoint público típico de suscripción a formulario
+  const path = `/api/public/forms/${encodeURIComponent(formId)}/subscribe`;
+  const body = JSON.stringify({ email, first_name, last_name });
+
+  try {
+    const r = await systemeFetch(path, { method: "POST", body }, { tolerate404: true });
+    if (!r.ok) return null;
+    // Algunos devuelven {id} otros {contact:{id:...}} o nada; volvemos a buscar por email
+    const after = await findContactIdByEmail(email);
+    return after || null;
+  } catch (e) {
+    console.warn("subscribeViaForm fallo:", String(e?.message || e));
+    return null;
+  }
+}
+
 async function createContact({ email, first_name = "", last_name = "" }) {
-  const r = await systemeFetchPublic(`/contacts`, {
-    method: "POST",
-    body: JSON.stringify({ email, first_name, last_name })
-  }, { tolerate404: false });
-  return Number(r.json?.id);
+  // 1) Intentar endpoints “contact”
+  const candidates = [
+    { path: `/api/contacts`, body: { email, first_name, last_name } },
+    { path: `/api/public/contacts`, body: { email, first_name, last_name } },
+  ];
+
+  for (const c of candidates) {
+    try {
+      const r = await systemeFetch(c.path, { method: "POST", body: JSON.stringify(c.body) }, { tolerate404: true });
+      if (r.ok) return Number(r.json?.id);
+    } catch (e) {
+      console.warn("Create contact intento fallido:", c.path, String(e?.message || e));
+    }
+  }
+
+  // 2) Plan B: suscribir al usuario a un formulario (si está configurado)
+  const viaForm = await subscribeViaForm({ email, first_name, last_name });
+  if (viaForm) return viaForm;
+
+  // 3) Nada funcionó
+  throw new Error("No se pudo crear el contacto en Systeme (endpoints de contactos no disponibles y sin FORM_ID).");
 }
 
 async function upsertSystemeContact({ email, first_name = "", last_name = "" }) {
-  // Buscar primero
   const existingId = await findContactIdByEmail(email);
   if (existingId) return existingId;
 
-  // Crear si no existe
   try {
     const id = await createContact({ email, first_name, last_name });
     if (id) return id;
   } catch (e) {
-    // Si ya existe (409/422) o algo raro, reintenta búsqueda
     console.warn("Create contact falló, reintento búsqueda amplia:", String(e?.message || e));
     const again = await findContactIdByEmail(email);
     if (again) return again;
@@ -148,10 +181,20 @@ async function upsertSystemeContact({ email, first_name = "", last_name = "" }) 
 }
 
 async function assignTagToContact(contactId, tagId) {
-  await systemeFetchPublic(`/contacts/${contactId}/tags`, {
-    method: "POST",
-    body: JSON.stringify({ tag_id: tagId })
-  });
+  // Intento normal
+  try {
+    await systemeFetch(`/api/contacts/${contactId}/tags`, {
+      method: "POST",
+      body: JSON.stringify({ tag_id: tagId })
+    });
+    return;
+  } catch (e) {
+    // Intento alterno por public
+    await systemeFetch(`/api/public/contacts/${contactId}/tags`, {
+      method: "POST",
+      body: JSON.stringify({ tag_id: tagId })
+    });
+  }
 }
 
 // ================== Handler ==================
@@ -208,7 +251,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error", err);
-    // devolvemos 200 para que Shopify no reintente en loop
+    // 200 para que Shopify no reintente en loop
     return res.status(200).json({ ok: true, error: String(err?.message || err) });
   }
 }
