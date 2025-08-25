@@ -1,35 +1,32 @@
 import crypto from "crypto";
 
-// ---- leer RAW para validar HMAC Shopify ----
 async function readRaw(req){
   const chunks=[]; for await (const c of req) chunks.push(c);
   return Buffer.concat(chunks);
 }
 
-// ---- cliente Systeme con manejo de errores ----
+// Cliente Systeme con ambos headers y logs claros
 async function systeme(path, {method="GET", headers={}, body}={}, tries=2){
   const url = `https://api.systeme.io${path}`;
   const resp = await fetch(url, {
     method,
     headers: {
-      "Authorization": `Bearer ${process.env.SYSTEME_API_KEY}`, // << clave
+      "X-API-Key": process.env.SYSTEME_API_KEY,        // ← clave pública
+      "Authorization": `Bearer ${process.env.SYSTEME_API_KEY}`, // ← compatibilidad
       "Accept": "application/json",
       ...headers
     },
     body
   });
 
-  // reintento si rate-limit/5xx
   if ((resp.status === 429 || resp.status >= 500) && tries > 0){
     const retryAfter = Number(resp.headers.get("Retry-After") || 1);
     await new Promise(r => setTimeout(r, retryAfter*1000));
     return systeme(path, {method, headers, body}, tries-1);
   }
-
   return resp;
 }
 
-// cache nombre->id de tags
 let TAG_CACHE = null;
 async function getTagIdByName(name){
   if (!name) return null;
@@ -52,32 +49,26 @@ async function getTagIdByName(name){
 export default async function handler(req, res){
   if (req.method !== "POST") return res.status(200).send("ok");
 
-  // 1) tienda
+  // 1) Valida tienda
   const shop = (req.headers["x-shopify-shop-domain"] || "").toLowerCase();
   if (shop !== (process.env.SHOPIFY_SHOP_DOMAIN || "").toLowerCase()){
     return res.status(400).send("bad shop");
   }
 
-  // 2) HMAC
+  // 2) Valida firma HMAC
   const raw = await readRaw(req);
   const theirHmac = req.headers["x-shopify-hmac-sha256"] || "";
-  const digest = crypto
-    .createHmac("sha256", process.env.SHOPIFY_WEBHOOK_SECRET)
-    .update(raw)
-    .digest("base64");
+  const digest = crypto.createHmac("sha256", process.env.SHOPIFY_WEBHOOK_SECRET).update(raw).digest("base64");
   if (!timingSafeEq(digest, theirHmac)) return res.status(401).send("invalid signature");
 
-  // 3) orden
-  let order;
-  try{ order = JSON.parse(raw.toString("utf8")); }
-  catch{ return res.status(400).send("json"); }
-
+  // 3) Orden
+  let order; try{ order = JSON.parse(raw.toString("utf8")); } catch { return res.status(400).send("json"); }
   const email = order.email || order.customer?.email;
   const firstName = order.customer?.first_name || order.billing_address?.first_name || "";
   const lastName  = order.customer?.last_name  || order.billing_address?.last_name  || "";
   if (!email) return res.status(200).send("no email");
 
-  // 4) map SKU -> tagName
+  // 4) Map SKU -> tag name
   const tagNames = new Set();
   try{
     const MAP = JSON.parse(process.env.COURSE_TAG_MAP_JSON || "{}"); // {"001":"lureon"}
@@ -89,10 +80,10 @@ export default async function handler(req, res){
   if (!tagNames.size) return res.status(200).send("no tag mapped");
 
   try{
-    // 5) crear/obtener contacto
+    // 5) Crear/obtener contacto
     let contactId = null;
 
-    // crear
+    // Intento crear
     let create = await systeme("/api/contacts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -100,7 +91,7 @@ export default async function handler(req, res){
     });
 
     if (!create.ok){
-      // buscar por email si ya existía
+      // Buscar por email si ya existía
       const q = await systeme(`/api/contacts?email=${encodeURIComponent(email)}`);
       if (!q.ok){
         const t = await q.text();
@@ -114,16 +105,12 @@ export default async function handler(req, res){
       const c = await create.json().catch(async () => ({ id: null }));
       contactId = c?.id || null;
     }
-
     if (!contactId) return res.status(500).send("contact");
 
-    // 6) asignar tags
+    // 6) Asignar tags
     for (const name of tagNames){
       const tagId = await getTagIdByName(name);
-      if (!tagId) {
-        console.error("Tag no encontrado por nombre:", name);
-        continue;
-      }
+      if (!tagId) { console.error("Tag no encontrado:", name); continue; }
       const add = await systeme(`/api/contacts/${contactId}/tags`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
