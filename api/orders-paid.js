@@ -34,23 +34,22 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(A, B);
 }
 
-// fetch con fallback /api -> /api/public y opción de no lanzar en 404
-async function systemeFetch(path, opts = {}, { tolerate404 = false } = {}) {
+// ================== Fetch Systeme (siempre /api/public) ==================
+async function systemeFetchPublic(path, opts = {}, { tolerate404 = false } = {}) {
   const base = "https://systeme.io";
+  const cleanPath = path.startsWith("/api/public/")
+    ? path
+    : path.startsWith("/api/")
+      ? path.replace(/^\/api\//, "/api/public/")
+      : `/api/public${path.startsWith("/") ? "" : "/"}${path}`;
+
   const headers = {
     "Content-Type": "application/json",
     "X-API-Key": env("SYSTEME_API_KEY"),
     ...(opts.headers || {}),
   };
 
-  // intento 1
-  let res = await fetch(base + path, { ...opts, headers });
-  if (res.status === 404 && path.startsWith("/api/") && !path.startsWith("/api/public/")) {
-    // intento 2: /api/public
-    const alt = path.replace(/^\/api\//, "/api/public/");
-    res = await fetch(base + alt, { ...opts, headers });
-  }
-
+  const res = await fetch(base + cleanPath, { ...opts, headers });
   const text = await res.text();
   let json;
   try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
@@ -59,29 +58,30 @@ async function systemeFetch(path, opts = {}, { tolerate404 = false } = {}) {
     if (tolerate404 && res.status === 404) {
       return { ok: false, status: 404, json };
     }
-    console.error("Systeme error", res.status, path, json);
-    throw new Error(`Systeme ${path} error: ${res.status}`);
+    console.error("Systeme error", res.status, cleanPath, json);
+    throw new Error(`Systeme ${cleanPath} error: ${res.status}`);
   }
   return { ok: true, status: res.status, json };
 }
 
 // ================== Tags ==================
 async function resolveSystemeTagId(tagValue) {
-  // Si es ID numérico, úsalo
+  // Si es ID numérico, úsalo tal cual
   if (/^\d+$/.test(String(tagValue))) return Number(tagValue);
 
   const desired = String(tagValue).trim().toLowerCase();
 
   // listar tags
-  const list = await systemeFetch(`/api/tags?perPage=100`, { method: "GET" });
+  const list = await systemeFetchPublic(`/tags?perPage=100`, { method: "GET" });
   const items = Array.isArray(list.json?.items) ? list.json.items
               : Array.isArray(list.json) ? list.json
               : [];
+
   const hit = items.find(t => String(t?.name || "").toLowerCase() === desired);
   if (hit?.id) return Number(hit.id);
 
   // crear tag si no existe
-  const created = await systemeFetch(`/api/tags`, {
+  const created = await systemeFetchPublic(`/tags`, {
     method: "POST",
     body: JSON.stringify({ name: String(tagValue) })
   });
@@ -92,22 +92,21 @@ async function resolveSystemeTagId(tagValue) {
 }
 
 // ================== Contactos ==================
-// Probar varias rutas de búsqueda; si ninguna sirve, devolvemos null (no error)
 async function findContactIdByEmail(email) {
   const q = encodeURIComponent(email);
+
+  // Rutas posibles del Public API
   const candidates = [
-    `/api/contacts?email=${q}`,
-    `/api/public/contacts?email=${q}`,
-    `/api/contacts/search?email=${q}`,
-    `/api/public/contacts/search?email=${q}`,
+    `/contacts?email=${q}`,
+    `/contacts/search?email=${q}`,
   ];
 
   for (const path of candidates) {
     try {
-      const r = await systemeFetch(path, { method: "GET" }, { tolerate404: true });
-      if (!r.ok) continue; // 404 -> probar siguiente
-      const data = r.json;
+      const r = await systemeFetchPublic(path, { method: "GET" }, { tolerate404: true });
+      if (!r.ok) continue; // 404 => probar otra
 
+      const data = r.json;
       const list = Array.isArray(data?.items) ? data.items
                  : Array.isArray(data) ? data
                  : Array.isArray(data?.data) ? data.data
@@ -116,7 +115,6 @@ async function findContactIdByEmail(email) {
       const found = list.find(c => String(c?.email || "").toLowerCase() === email.toLowerCase());
       if (found?.id) return Number(found.id);
     } catch (e) {
-      // otros errores: seguimos probando el siguiente patrón
       console.warn("Lookup email fallback next for", path, String(e?.message || e));
     }
   }
@@ -124,7 +122,7 @@ async function findContactIdByEmail(email) {
 }
 
 async function createContact({ email, first_name = "", last_name = "" }) {
-  const r = await systemeFetch(`/api/contacts`, {
+  const r = await systemeFetchPublic(`/contacts`, {
     method: "POST",
     body: JSON.stringify({ email, first_name, last_name })
   }, { tolerate404: false });
@@ -132,16 +130,16 @@ async function createContact({ email, first_name = "", last_name = "" }) {
 }
 
 async function upsertSystemeContact({ email, first_name = "", last_name = "" }) {
-  // Intento 1: encontrar
+  // Buscar primero
   const existingId = await findContactIdByEmail(email);
   if (existingId) return existingId;
 
-  // Intento 2: crear
+  // Crear si no existe
   try {
     const id = await createContact({ email, first_name, last_name });
     if (id) return id;
   } catch (e) {
-    // Algunas cuentas devuelven 409/422 si ya existe; reintentar búsqueda “amplia”
+    // Si ya existe (409/422) o algo raro, reintenta búsqueda
     console.warn("Create contact falló, reintento búsqueda amplia:", String(e?.message || e));
     const again = await findContactIdByEmail(email);
     if (again) return again;
@@ -150,7 +148,7 @@ async function upsertSystemeContact({ email, first_name = "", last_name = "" }) 
 }
 
 async function assignTagToContact(contactId, tagId) {
-  await systemeFetch(`/api/contacts/${contactId}/tags`, {
+  await systemeFetchPublic(`/contacts/${contactId}/tags`, {
     method: "POST",
     body: JSON.stringify({ tag_id: tagId })
   });
@@ -210,7 +208,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error", err);
-    // devolver 200 para que Shopify no reintente sin parar
+    // devolvemos 200 para que Shopify no reintente en loop
     return res.status(200).json({ ok: true, error: String(err?.message || err) });
   }
 }
