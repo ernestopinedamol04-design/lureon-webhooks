@@ -1,11 +1,8 @@
 // api/orders-paid.js
-// Vercel Serverless Function para el webhook "orders/paid" de Shopify
-// Crea/actualiza contacto en Systeme y le asigna el tag del curso (por SKU)
-
+// Webhook de Shopify (orders/paid) -> Crear/actualizar contacto en Systeme y asignar tag por SKU
 import crypto from "crypto";
 
-// --------- Helpers base ---------
-
+// -------------------- Utilidades --------------------
 function env(name, required = true) {
   const v = process.env[name];
   if (required && (!v || String(v).trim() === "")) {
@@ -39,23 +36,29 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-async function systemeFetch(path, opts = {}) {
+// Llamada a Systeme con fallback /api -> /api/public si hay 404
+async function systemeFetchWithFallback(path, opts = {}) {
   const base = "https://systeme.io";
-  const res = await fetch(`${base}${path}`, {
-    ...opts,
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-Key": env("SYSTEME_API_KEY"),
-      ...(opts.headers || {}),
-    },
-  });
+  const headers = {
+    "Content-Type": "application/json",
+    "X-API-Key": env("SYSTEME_API_KEY"),
+    ...(opts.headers || {}),
+  };
 
-  const text = await res.text();
+  // 1er intento: /api/...
+  const url1 = `${base}${path}`;
+  let res = await fetch(url1, { ...opts, headers });
+  let text = await res.text();
   let json;
-  try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
+  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+
+  if (res.status === 404 && path.startsWith("/api/") && !path.startsWith("/api/public/")) {
+    // 2º intento: /api/public/...
+    const pathPublic = path.replace(/^\/api\//, "/api/public/");
+    const url2 = `${base}${pathPublic}`;
+    res = await fetch(url2, { ...opts, headers });
+    text = await res.text();
+    try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
   }
 
   if (!res.ok) {
@@ -65,178 +68,121 @@ async function systemeFetch(path, opts = {}) {
   return json;
 }
 
-// --------- Lógica de tags (acepta ID o nombre) ---------
-
+// -------------------- Tags --------------------
+// Acepta valor como ID o nombre; si es nombre, busca y si no existe lo crea
 async function resolveSystemeTagId(tagValue) {
-  // Si el valor son dígitos, asumimos que YA es un ID
   if (/^\d+$/.test(String(tagValue))) {
-    return Number(tagValue);
+    return Number(tagValue); // ya es ID
   }
-
   const desiredName = String(tagValue).trim().toLowerCase();
 
-  // 1) buscar por nombre (paginado simple, 100 items)
-  const list = await systemeFetch(`/api/tags?perPage=100`);
+  // listar tags (paginado simple)
+  const list = await systemeFetchWithFallback(`/api/tags?perPage=100`, { method: "GET" });
   const items = Array.isArray(list?.items) ? list.items : Array.isArray(list) ? list : [];
-
   const found = items.find((t) => String(t?.name || "").toLowerCase() === desiredName);
-  if (found?.id) {
-    return Number(found.id);
-  }
+  if (found?.id) return Number(found.id);
 
-  // 2) crear tag
-  const created = await systemeFetch(`/api/tags`, {
+  // crear tag
+  const created = await systemeFetchWithFallback(`/api/tags`, {
     method: "POST",
     body: JSON.stringify({ name: String(tagValue) }),
   });
-
   const tagId = Number(created?.id);
   if (!tagId) throw new Error("No se pudo crear el tag en Systeme.");
   console.log("Tag creado en Systeme:", tagId);
   return tagId;
 }
 
-// --------- Contacto en Systeme ---------
+// -------------------- Contactos --------------------
+async function findContactIdByEmail(email) {
+  const q = encodeURIComponent(email);
+  const search = await systemeFetchWithFallback(`/api/contacts?email=${q}`, { method: "GET" });
+  const items = Array.isArray(search?.items) ? search.items : Array.isArray(search) ? search : [];
+  const found = items.find((c) => String(c?.email || "").toLowerCase() === email.toLowerCase());
+  return found?.id ? Number(found.id) : null;
+}
+
+async function createContact({ email, first_name = "", last_name = "" }) {
+  const created = await systemeFetchWithFallback(`/api/contacts`, {
+    method: "POST",
+    body: JSON.stringify({ email, first_name, last_name }),
+  });
+  return Number(created?.id);
+}
 
 async function upsertSystemeContact({ email, first_name = "", last_name = "" }) {
-  // Algunos tenants soportan POST /api/contacts como upsert.
-  // Si tu cuenta no hace upsert, puedes hacer primero un GET por email.
-  // Intento 1: crear/actualizar directo
-  try {
-    const created = await systemeFetch(`/api/contacts`, {
-      method: "POST",
-      body: JSON.stringify({ email, first_name, last_name }),
-    });
-    return Number(created?.id);
-  } catch (e) {
-    // Intento 2 (fallback): buscar por email y si existe usar ese id
-    try {
-      const q = encodeURIComponent(email);
-      const search = await systemeFetch(`/api/contacts?email=${q}`);
-      const items = Array.isArray(search?.items) ? search.items : Array.isArray(search) ? search : [];
-      const found = items.find((c) => String(c?.email || "").toLowerCase() === email.toLowerCase());
-      if (found?.id) return Number(found.id);
-    } catch {}
-    throw e;
-  }
+  // Busca primero por email para evitar duplicados y lidiar con cuentas que no “upsertean”
+  const existingId = await findContactIdByEmail(email);
+  if (existingId) return existingId;
+  return await createContact({ email, first_name, last_name });
 }
 
 async function assignTagToContact(contactId, tagId) {
-  await systemeFetch(`/api/contacts/${contactId}/tags`, {
+  await systemeFetchWithFallback(`/api/contacts/${contactId}/tags`, {
     method: "POST",
     body: JSON.stringify({ tag_id: tagId }),
   });
 }
 
-// --------- Handler principal ---------
-
+// -------------------- Handler --------------------
 export default async function handler(req, res) {
   try {
-    // Sólo aceptamos POST
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method Not Allowed" });
-    }
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
 
-    // 1) Leer raw body para verificar HMAC
+    // Raw body para HMAC
     const raw = await readRawBody(req);
 
-    // 2) Verificación de Shopify
+    // Verificación Shopify
     const hmacHeader = req.headers["x-shopify-hmac-sha256"];
     const topic = req.headers["x-shopify-topic"];
     const shop = req.headers["x-shopify-shop-domain"];
+    if (!hmacHeader || !topic || !shop) return res.status(400).json({ error: "Bad Request" });
 
-    if (!hmacHeader || !topic || !shop) {
-      console.warn("Faltan headers de Shopify");
-      return res.status(400).json({ error: "Bad Request" });
-    }
+    if (shop !== env("SHOPIFY_SHOP_DOMAIN")) return res.status(401).json({ error: "Unauthorized" });
 
-    // Dominio esperado (mi-tienda.myshopify.com)
-    const expectedShop = env("SHOPIFY_SHOP_DOMAIN");
-    if (shop !== expectedShop) {
-      console.warn("Shop no permitido:", shop);
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+    const digest = crypto.createHmac("sha256", env("SHOPIFY_WEBHOOK_SECRET")).update(raw).digest("base64");
+    if (!timingSafeEqual(digest, String(hmacHeader))) return res.status(401).json({ error: "Unauthorized" });
 
-    // HMAC
-    const secret = env("SHOPIFY_WEBHOOK_SECRET");
-    const digest = crypto.createHmac("sha256", secret).update(raw).digest("base64");
-    if (!timingSafeEqual(digest, String(hmacHeader))) {
-      console.warn("HMAC inválido");
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+    if (topic !== "orders/paid") return res.status(200).json({ ok: true, ignored: true });
 
-    // 3) Validar evento
-    if (topic !== "orders/paid") {
-      console.log("Ignorando topic:", topic);
-      return res.status(200).json({ ok: true, ignored: true });
-    }
-
-    // 4) Parsear payload
     const payload = safeJsonParse(raw);
-    if (!payload) {
-      console.warn("Payload vacío/ inválido");
-      return res.status(400).json({ error: "Bad Request" });
-    }
+    if (!payload) return res.status(400).json({ error: "Bad Request" });
 
-    // 5) Extraer cliente
     const email = String(payload?.email || payload?.customer?.email || "").trim();
     const firstName = payload?.customer?.first_name || payload?.billing_address?.first_name || "";
-    const lastName = payload?.customer?.last_name || payload?.billing_address?.last_name || "";
+    const lastName  = payload?.customer?.last_name  || payload?.billing_address?.last_name  || "";
+    if (!email) return res.status(200).json({ ok: true, reason: "order-without-email" });
 
-    if (!email) {
-      console.log("Orden sin email; no se crea contacto.");
-      return res.status(200).json({ ok: true });
-    }
-
-    // 6) Determinar SKU y tag configurado
+    // Determinar tag por SKU
     const lineItems = Array.isArray(payload?.line_items) ? payload.line_items : [];
-    // Carga el mapa { "SKU": "tagName|tagId" }
     let tagMap = {};
-    try {
-      tagMap = JSON.parse(process.env.COURSE_TAG_MAP_JSON || "{}");
-    } catch {
-      tagMap = {};
-    }
+    try { tagMap = JSON.parse(process.env.COURSE_TAG_MAP_JSON || "{}"); } catch { tagMap = {}; }
 
-    // Buscar la primera línea cuyo SKU exista en el mapa
     let matchedSku = null;
     for (const li of lineItems) {
       const sku = String(li?.sku || "").trim();
-      if (sku && tagMap[sku]) {
-        matchedSku = sku;
-        break;
-      }
+      if (sku && tagMap[sku]) { matchedSku = sku; break; }
     }
+    if (!matchedSku) return res.status(200).json({ ok: true, reason: "sku-not-mapped" });
 
-    if (!matchedSku) {
-      console.log("No hay SKU con tag configurado en esta orden. Nada que hacer.");
-      return res.status(200).json({ ok: true });
-    }
+    const tagValue = tagMap[matchedSku];
+    console.log("SKU", matchedSku, "→ tag configurado:", tagValue);
 
-    const tagValue = tagMap[matchedSku]; // puede ser "lureon" o "1616892"
-    console.log("SKU detectado:", matchedSku, "→ tag configurado:", tagValue);
-
-    // 7) Resolver ID de tag (ID directo o por nombre)
+    // Resolver/crear tag e upsert contacto
     const tagId = await resolveSystemeTagId(tagValue);
-    console.log("Usando tagId:", tagId);
+    console.log("Tag ID a usar:", tagId);
 
-    // 8) Upsert contacto en Systeme
-    const contactId = await upsertSystemeContact({
-      email,
-      first_name: firstName || "",
-      last_name: lastName || "",
-    });
+    const contactId = await upsertSystemeContact({ email, first_name: firstName, last_name: lastName });
     console.log("Contacto Systeme id:", contactId);
 
-    // 9) Asignar tag (dispara tu automatización en Systeme)
+    // Asignar tag (disparará tu automatización)
     await assignTagToContact(contactId, tagId);
     console.log(`Tag ${tagId} asignado a contacto ${contactId}`);
 
-    // 10) Listo
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Handler error", err);
+    // Devolvemos 200 para que Shopify no reintente en bucle, pero registramos el error:
     return res.status(200).json({ ok: true, error: String(err?.message || err) });
-    // Respondemos 200 para que Shopify no reintente indefinidamente.
   }
 }
