@@ -5,20 +5,20 @@ async function readRaw(req){
   return Buffer.concat(chunks);
 }
 
-// Cliente Systeme con ambos headers y logs claros
 async function systeme(path, {method="GET", headers={}, body}={}, tries=2){
   const url = `https://api.systeme.io${path}`;
   const resp = await fetch(url, {
     method,
     headers: {
-      "X-API-Key": process.env.SYSTEME_API_KEY,        // ← clave pública
-      "Authorization": `Bearer ${process.env.SYSTEME_API_KEY}`, // ← compatibilidad
+      "X-API-Key": process.env.SYSTEME_API_KEY,
+      "Authorization": `Bearer ${process.env.SYSTEME_API_KEY}`,
       "Accept": "application/json",
       ...headers
     },
     body
   });
 
+  // reintenta si 5xx / 429
   if ((resp.status === 429 || resp.status >= 500) && tries > 0){
     const retryAfter = Number(resp.headers.get("Retry-After") || 1);
     await new Promise(r => setTimeout(r, retryAfter*1000));
@@ -27,48 +27,76 @@ async function systeme(path, {method="GET", headers={}, body}={}, tries=2){
   return resp;
 }
 
-let TAG_CACHE = null;
-async function getTagIdByName(name){
+// parsea JSON con fallback a texto (para logs de error)
+async function safeJson(resp){
+  const txt = await resp.text();
+  try { return { json: JSON.parse(txt), text: txt }; }
+  catch { return { json: null, text: txt }; }
+}
+
+// Busca tag por nombre; si no existe, lo crea y devuelve su ID
+async function ensureTagIdByName(name){
   if (!name) return null;
-  if (!TAG_CACHE){
-    const r = await systeme(`/api/tags?limit=200`);
-    if (!r.ok){
-      const t = await r.text();
-      console.error("Systeme /api/tags error:", r.status, t.slice(0,300));
-      return null;
-    }
-    const data = await r.json();
-    TAG_CACHE = new Map();
-    for (const t of (data.items || [])){
-      TAG_CACHE.set(String(t.name || "").toLowerCase(), t.id);
-    }
+
+  // 1) listar tags (forma amplia)
+  let r = await systeme(`/api/tags?limit=200`);
+  if (r.ok){
+    const { json } = await safeJson(r);
+    const arr = (json?.items) || (json?.data) || (json?.tags) || [];
+    const hit = arr.find(t => String(t?.name || "").toLowerCase() === String(name).toLowerCase());
+    if (hit?.id) return hit.id;
+  } else {
+    const { text } = await safeJson(r);
+    console.error("Systeme /api/tags error:", r.status, text.slice(0,300));
   }
-  return TAG_CACHE.get(String(name).toLowerCase()) || null;
+
+  // 2) intento GET filtrando por nombre (algunas cuentas lo soportan)
+  r = await systeme(`/api/tags?name=${encodeURIComponent(name)}`);
+  if (r.ok){
+    const { json } = await safeJson(r);
+    const arr = (json?.items) || (json?.data) || (json?.tags) || [];
+    const hit = arr.find(t => String(t?.name || "").toLowerCase() === String(name).toLowerCase());
+    if (hit?.id) return hit.id;
+  }
+
+  // 3) crear tag si no existe
+  const create = await systeme(`/api/tags`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
+  if (!create.ok){
+    const { text } = await safeJson(create);
+    console.error("Systeme POST /api/tags error:", create.status, text.slice(0,300));
+    return null;
+  }
+  const { json: created } = await safeJson(create);
+  return created?.id || null;
 }
 
 export default async function handler(req, res){
   if (req.method !== "POST") return res.status(200).send("ok");
 
-  // 1) Valida tienda
+  // 1) tienda
   const shop = (req.headers["x-shopify-shop-domain"] || "").toLowerCase();
   if (shop !== (process.env.SHOPIFY_SHOP_DOMAIN || "").toLowerCase()){
     return res.status(400).send("bad shop");
   }
 
-  // 2) Valida firma HMAC
+  // 2) HMAC
   const raw = await readRaw(req);
   const theirHmac = req.headers["x-shopify-hmac-sha256"] || "";
   const digest = crypto.createHmac("sha256", process.env.SHOPIFY_WEBHOOK_SECRET).update(raw).digest("base64");
   if (!timingSafeEq(digest, theirHmac)) return res.status(401).send("invalid signature");
 
-  // 3) Orden
+  // 3) orden
   let order; try{ order = JSON.parse(raw.toString("utf8")); } catch { return res.status(400).send("json"); }
   const email = order.email || order.customer?.email;
   const firstName = order.customer?.first_name || order.billing_address?.first_name || "";
   const lastName  = order.customer?.last_name  || order.billing_address?.last_name  || "";
   if (!email) return res.status(200).send("no email");
 
-  // 4) Map SKU -> tag name
+  // 4) map SKU -> tag name
   const tagNames = new Set();
   try{
     const MAP = JSON.parse(process.env.COURSE_TAG_MAP_JSON || "{}"); // {"001":"lureon"}
@@ -80,10 +108,10 @@ export default async function handler(req, res){
   if (!tagNames.size) return res.status(200).send("no tag mapped");
 
   try{
-    // 5) Crear/obtener contacto
+    // 5) crear/obtener contacto
     let contactId = null;
 
-    // Intento crear
+    // crear
     let create = await systeme("/api/contacts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -91,34 +119,38 @@ export default async function handler(req, res){
     });
 
     if (!create.ok){
-      // Buscar por email si ya existía
+      // buscar por email si ya existía
       const q = await systeme(`/api/contacts?email=${encodeURIComponent(email)}`);
       if (!q.ok){
-        const t = await q.text();
-        console.error("Systeme GET /api/contacts error:", q.status, t.slice(0,300));
+        const { text } = await safeJson(q);
+        console.error("Systeme GET /api/contacts error:", q.status, text.slice(0,300));
         return res.status(500).send("contact");
       }
-      const data = await q.json();
-      const found = (data.items || []).find(c => (c.email || "").toLowerCase() === email.toLowerCase());
+      const { json } = await safeJson(q);
+      const arr = (json?.items) || (json?.data) || (json?.contacts) || [];
+      const found = arr.find(c => (c?.email || "").toLowerCase() === email.toLowerCase());
       contactId = found?.id || null;
     } else {
-      const c = await create.json().catch(async () => ({ id: null }));
-      contactId = c?.id || null;
+      const { json } = await safeJson(create);
+      contactId = json?.id || null;
     }
     if (!contactId) return res.status(500).send("contact");
 
-    // 6) Asignar tags
+    // 6) asegurar tag (buscar o crear) y asignar
     for (const name of tagNames){
-      const tagId = await getTagIdByName(name);
-      if (!tagId) { console.error("Tag no encontrado:", name); continue; }
+      const tagId = await ensureTagIdByName(name);
+      if (!tagId) {
+        console.error("Tag no encontrado/creado:", name);
+        continue;
+      }
       const add = await systeme(`/api/contacts/${contactId}/tags`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tagId })
       });
       if (!add.ok){
-        const t = await add.text();
-        console.error("Systeme POST add tag error:", add.status, t.slice(0,300));
+        const { text } = await safeJson(add);
+        console.error("Systeme POST add tag error:", add.status, text.slice(0,300));
       }
     }
 
