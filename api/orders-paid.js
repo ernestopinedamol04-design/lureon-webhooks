@@ -36,38 +36,68 @@ function timingSafeEqual(a, b) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** ================== Fetch Systeme (conmutación /api <-> /api/public) ================== **/
+/** ================== Fetch Systeme robusto ================== **/
 async function systemeFetch(path, opts = {}, { tolerate404 = false } = {}) {
   const base = "https://systeme.io";
-  const headers = {
+
+  // Cabeceras con/sin API key
+  const withKey = {
     "Content-Type": "application/json",
     "X-API-Key": env("SYSTEME_API_KEY"),
     ...(opts.headers || {}),
   };
+  const noKey = {
+    "Content-Type": "application/json",
+    ...(opts.headers || {}),
+  };
 
-  // intento 1
-  let url = base + path;
-  let res = await fetch(url, { ...opts, headers });
-
-  // intento 2: alternar /api <-> /api/public si 404
-  if (res.status === 404 && path.startsWith("/api/")) {
-    const alt = path.startsWith("/api/public/")
-      ? path.replace(/^\/api\/public\//, "/api/")
-      : path.replace(/^\/api\//, "/api/public/");
-    url = base + alt;
-    res = await fetch(url, { ...opts, headers });
+  // Construimos variantes de URL (api <-> api/public) y de cabecera (con/sin key)
+  const urls = [path];
+  if (path.startsWith("/api/public/")) {
+    urls.push(path.replace(/^\/api\/public\//, "/api/"));
+  } else if (path.startsWith("/api/")) {
+    urls.push(path.replace(/^\/api\//, "/api/public/"));
   }
 
-  const text = await res.text();
-  let json;
-  try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-
-  if (!res.ok) {
-    if (tolerate404 && res.status === 404) return { ok: false, status: 404, json };
-    console.error("Systeme error", res.status, path, json);
-    throw new Error(`Systeme ${path} error: ${res.status}`);
+  const attempts = [];
+  for (const u of urls) {
+    attempts.push({ url: base + u, headers: withKey, label: `${u} [withKey]` });
+    attempts.push({ url: base + u, headers: noKey,  label: `${u} [noKey]`  });
   }
-  return { ok: true, status: res.status, json };
+
+  let last = null;
+  for (const attempt of attempts) {
+    try {
+      const res = await fetch(attempt.url, { ...opts, headers: attempt.headers });
+      const text = await res.text();
+      let json;
+      try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+
+      if (res.ok) {
+        if (attempt.label.includes("[noKey]")) {
+          console.log("Systeme OK", res.status, attempt.label);
+        }
+        return { ok: true, status: res.status, json };
+      }
+
+      console.warn("Systeme not OK", res.status, attempt.label);
+      // Si toleramos 404 y efectivamente es 404, devolvemos "no ok" pero sin lanzar
+      if (tolerate404 && res.status === 404) {
+        return { ok: false, status: 404, json };
+      }
+      last = { ok: false, status: res.status, json, attempt: attempt.label };
+    } catch (e) {
+      console.warn("Systeme fetch error for", attempt.label, String(e?.message || e));
+      last = { ok: false, status: 0, json: { error: String(e?.message || e) }, attempt: attempt.label };
+    }
+  }
+
+  // Si llegamos aquí, todos fallaron
+  if (last) {
+    console.error("Systeme error", last.status, path, "lastAttempt:", last.attempt, last.json);
+    throw new Error(`Systeme ${path} error: ${last.status}`);
+  }
+  throw new Error(`Systeme ${path} error: unknown`);
 }
 
 /** ================== Tag ID desde el mapa (sin llamar a /api/tags) ================== **/
@@ -129,7 +159,7 @@ async function subscribeViaForm({ email, first_name = "", last_name = "" }) {
 
   // Pequeña espera y hasta 3 reintentos buscando el contacto por email
   for (let i = 0; i < 3; i++) {
-    await sleep(500);
+    await sleep(600);
     const id = await findContactIdByEmail(email);
     if (id) return id;
   }
@@ -139,7 +169,7 @@ async function subscribeViaForm({ email, first_name = "", last_name = "" }) {
 async function createContact({ email, first_name = "", last_name = "" }) {
   // 1) Intentos directos (algunas cuentas lo permiten)
   const candidates = [
-    { path: `/api/contacts`, body: { email, first_name, last_name } },
+    { path: `/api/contacts`,        body: { email, first_name, last_name } },
     { path: `/api/public/contacts`, body: { email, first_name, last_name } },
   ];
   for (const c of candidates) {
@@ -151,7 +181,7 @@ async function createContact({ email, first_name = "", last_name = "" }) {
     }
   }
 
-  // 2) Plan B: formulario público (funciona aunque los endpoints de contactos no estén)
+  // 2) Plan B: formulario público
   const viaForm = await subscribeViaForm({ email, first_name, last_name });
   if (viaForm) return viaForm;
 
