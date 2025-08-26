@@ -34,6 +34,8 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(A, B);
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /** ================== Fetch Systeme (conmutación /api <-> /api/public) ================== **/
 async function systemeFetch(path, opts = {}, { tolerate404 = false } = {}) {
   const base = "https://systeme.io";
@@ -73,22 +75,17 @@ function getTagIdFromMap(sku) {
   let tagMap = {};
   try { tagMap = JSON.parse(process.env.COURSE_TAG_MAP_JSON || "{}"); } catch {}
   const raw = tagMap[sku];
-
-  if (raw == null) {
-    throw new Error(`SKU "${sku}" no está mapeado en COURSE_TAG_MAP_JSON.`);
-  }
+  if (raw == null) throw new Error(`SKU "${sku}" no está mapeado en COURSE_TAG_MAP_JSON.`);
   const s = String(raw).trim();
   if (!/^\d+$/.test(s)) {
     throw new Error(
-      `COURSE_TAG_MAP_JSON debe mapear a IDs NUMÉRICOS de etiqueta. ` +
-      `Valor para SKU "${sku}" recibido: "${s}".`
+      `COURSE_TAG_MAP_JSON debe mapear a IDs NUMÉRICOS de etiqueta. Valor para SKU "${sku}": "${s}".`
     );
   }
   return Number(s);
 }
 
 /** ================== Contactos ================== **/
-// Probar varias rutas de búsqueda; si ninguna sirve, devolvemos null
 async function findContactIdByEmail(email) {
   const q = encodeURIComponent(email);
   const candidates = [
@@ -116,8 +113,31 @@ async function findContactIdByEmail(email) {
   return null;
 }
 
+// Suscribe por formulario público y luego intenta recuperar el contacto
+async function subscribeViaForm({ email, first_name = "", last_name = "" }) {
+  const formId = process.env.SYSTEME_FALLBACK_FORM_ID;
+  if (!formId) return null; // si no está configurado, no hay plan B
+
+  const path = `/api/public/forms/${encodeURIComponent(formId)}/subscribe`;
+  const body = JSON.stringify({ email, first_name, last_name });
+
+  const r = await systemeFetch(path, { method: "POST", body }, { tolerate404: true });
+  if (!r.ok) {
+    console.warn("subscribeViaForm: endpoint público no disponible");
+    return null;
+  }
+
+  // Pequeña espera y hasta 3 reintentos buscando el contacto por email
+  for (let i = 0; i < 3; i++) {
+    await sleep(500);
+    const id = await findContactIdByEmail(email);
+    if (id) return id;
+  }
+  return null;
+}
+
 async function createContact({ email, first_name = "", last_name = "" }) {
-  // Intentos conocidos
+  // 1) Intentos directos (algunas cuentas lo permiten)
   const candidates = [
     { path: `/api/contacts`, body: { email, first_name, last_name } },
     { path: `/api/public/contacts`, body: { email, first_name, last_name } },
@@ -130,7 +150,12 @@ async function createContact({ email, first_name = "", last_name = "" }) {
       console.warn("Create contact intento fallido:", c.path, String(e?.message || e));
     }
   }
-  // Sin fallback por formulario (lo desactivaste) no hay otra vía confiable.
+
+  // 2) Plan B: formulario público (funciona aunque los endpoints de contactos no estén)
+  const viaForm = await subscribeViaForm({ email, first_name, last_name });
+  if (viaForm) return viaForm;
+
+  // 3) Nada funcionó
   throw new Error("No se pudo crear el contacto en Systeme (endpoints de contactos no disponibles).");
 }
 
@@ -140,6 +165,10 @@ async function upsertSystemeContact({ email, first_name = "", last_name = "" }) 
 
   const id = await createContact({ email, first_name, last_name });
   if (id) return id;
+
+  // seguridad extra
+  const again = await findContactIdByEmail(email);
+  if (again) return again;
 
   throw new Error("No se pudo upsert el contacto en Systeme.");
 }
